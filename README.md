@@ -50,9 +50,13 @@ Memory Deallocation
 28.	Return from the main function.
 
 ## PROGRAM:
-  ```
+```
+!pip install git+https://github.com/andreinechaev/nvcc4jupyter.git
+%load_ext nvcc4jupyter
+```
+## Unrolling8
+```
 %%cuda
-
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <sys/time.h>
@@ -130,225 +134,364 @@ inline double seconds()
 }
 
 #endif // _COMMON_H
-void checkResult(float *hostRef, float *gpuRef, const int N)
+// Kernel function declaration
+__global__ void reduceUnrolling8(int *g_idata, int *g_odata, unsigned int n);
+// Function to calculate elapsed time in milliseconds
+double getElapsedTime(struct timeval start, struct timeval end)
 {
-    double epsilon = 1.0E-8;
+    long seconds = end.tv_sec - start.tv_sec;
+    long microseconds = end.tv_usec - start.tv_usec;
+    double elapsed = seconds + microseconds / 1e6;
+    return elapsed * 1000; // Convert to milliseconds
+}
+int main()
+{
+    // Input size and host memory allocation
+    unsigned int n = 1 << 20; // 1 million elements
+    size_t size = n * sizeof(int);
+    int *h_idata = (int *)malloc(size);
+    int *h_odata = (int *)malloc(size);
 
-    for (int i = 0; i < N; i++)
+    // Initialize input data on the host
+    for (unsigned int i = 0; i < n; i++)
     {
-        if (abs(hostRef[i] - gpuRef[i]) > epsilon)
+        h_idata[i] = 1;
+    }
+
+    // Device memory allocation
+    int *d_idata, *d_odata;
+    cudaMalloc((void **)&d_idata, size);
+    cudaMalloc((void **)&d_odata, size);
+
+    // Copy input data from host to device
+    cudaMemcpy(d_idata, h_idata, size, cudaMemcpyHostToDevice);
+
+    // Define grid and block dimensions
+    dim3 blockSize(256); // 256 threads per block
+    dim3 gridSize((n + blockSize.x * 8 - 1) / (blockSize.x * 8));
+
+    // Start CPU timer
+    struct timeval start_cpu, end_cpu;
+    gettimeofday(&start_cpu, NULL);
+
+    // Compute the sum on the CPU
+    int sum_cpu = 0;
+    for (unsigned int i = 0; i < n; i++)
+    {
+        sum_cpu += h_idata[i];
+    }
+
+    // Stop CPU timer
+    gettimeofday(&end_cpu, NULL);
+    double elapsedTime_cpu = getElapsedTime(start_cpu, end_cpu);
+
+    // Start GPU timer
+    struct timeval start_gpu, end_gpu;
+    gettimeofday(&start_gpu, NULL);
+
+    // Launch the reduction kernel
+    reduceUnrolling8<<<gridSize, blockSize>>>(d_idata, d_odata, n);
+
+    // Copy the result from device to host
+    cudaMemcpy(h_odata, d_odata, size, cudaMemcpyDeviceToHost);
+
+    // Compute the final sum on the GPU
+    int sum_gpu = 0;
+    for (unsigned int i = 0; i < gridSize.x; i++)
+    {
+        sum_gpu += h_odata[i];
+    }
+
+    // Stop GPU timer
+    gettimeofday(&end_gpu, NULL);
+    double elapsedTime_gpu = getElapsedTime(start_gpu, end_gpu);
+
+    // Print the results and elapsed times
+    printf("CPU Sum: %d\n", sum_cpu);
+    printf("GPU Sum: %d\n", sum_gpu);
+    printf("CPU Elapsed Time: %.2f ms\n", elapsedTime_cpu);
+    printf("GPU Elapsed Time: %.2f ms\n", elapsedTime_gpu);
+
+    // Free memory
+    free(h_idata);
+    free(h_odata);
+    cudaFree(d_idata);
+    cudaFree(d_odata);
+
+    return 0;
+}
+
+__global__ void reduceUnrolling8(int *g_idata, int *g_odata, unsigned int n)
+{
+    // Set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 8 + threadIdx.x;
+
+    // Convert global data pointer to the local pointer of this block
+    int *idata = g_idata + blockIdx.x * blockDim.x * 8;
+
+    // Unrolling 8
+    if (idx + 7 * blockDim.x < n)
+    {
+        int a1 = g_idata[idx];
+        int a2 = g_idata[idx + blockDim.x];
+        int a3 = g_idata[idx + 2 * blockDim.x];
+        int a4 = g_idata[idx + 3 * blockDim.x];
+        int b1 = g_idata[idx + 4 * blockDim.x];
+        int b2 = g_idata[idx + 5 * blockDim.x];
+        int b3 = g_idata[idx + 6 * blockDim.x];
+        int b4 = g_idata[idx + 7 * blockDim.x];
+        g_idata[idx] = a1 + a2 + a3 + a4 + b1 + b2 + b3 + b4;
+    }
+
+
+    __syncthreads();
+
+    // In-place reduction in global memory
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
         {
-            printf("Arrays do not match!\n");
-            printf("host %5.2f gpu %5.2f at current %d\n", hostRef[i],
-                    gpuRef[i], i);
-            break;
+            idata[tid] += idata[tid + stride];
         }
+
+        // Synchronize within thread block
+        __syncthreads();
     }
 
-    return;
-}
-
-void initialData(float *ip, int size)
-{
-    int i;
-
-    for (i = 0; i < size; i++)
+    // Write result for this block to global memory
+    if (tid == 0)
     {
-        ip[i] = (float)( rand() & 0xFF ) / 10.0f;
+        g_odata[blockIdx.x] = idata[0];
     }
+}
+```
+## Unrolling16
+```
+%%cuda
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <sys/time.h>
 
-    return;
+#ifndef _COMMON_H
+#define _COMMON_H
+
+#define CHECK(call)                                                            \
+{                                                                              \
+    const cudaError_t error = call;                                            \
+    if (error != cudaSuccess)                                                  \
+    {                                                                          \
+        fprintf(stderr, "Error: %s:%d, ", __FILE__, __LINE__);                 \
+        fprintf(stderr, "code: %d, reason: %s\n", error,                       \
+                cudaGetErrorString(error));                                    \
+        exit(1);                                                               \
+    }                                                                          \
 }
 
-void sumArraysOnHost(float *A, float *B, float *C, const int N)
+#define CHECK_CUBLAS(call)                                                     \
+{                                                                              \
+    cublasStatus_t err;                                                        \
+    if ((err = (call)) != CUBLAS_STATUS_SUCCESS)                               \
+    {                                                                          \
+        fprintf(stderr, "Got CUBLAS error %d at %s:%d\n", err, __FILE__,       \
+                __LINE__);                                                     \
+        exit(1);                                                               \
+    }                                                                          \
+}
+
+#define CHECK_CURAND(call)                                                     \
+{                                                                              \
+    curandStatus_t err;                                                        \
+    if ((err = (call)) != CURAND_STATUS_SUCCESS)                               \
+    {                                                                          \
+        fprintf(stderr, "Got CURAND error %d at %s:%d\n", err, __FILE__,       \
+                __LINE__);                                                     \
+        exit(1);                                                               \
+    }                                                                          \
+}
+
+#define CHECK_CUFFT(call)                                                      \
+{                                                                              \
+    cufftResult err;                                                           \
+    if ( (err = (call)) != CUFFT_SUCCESS)                                      \
+    {                                                                          \
+        fprintf(stderr, "Got CUFFT error %d at %s:%d\n", err, __FILE__,        \
+                __LINE__);                                                     \
+        exit(1);                                                               \
+    }                                                                          \
+}
+
+#define CHECK_CUSPARSE(call)                                                   \
+{                                                                              \
+    cusparseStatus_t err;                                                      \
+    if ((err = (call)) != CUSPARSE_STATUS_SUCCESS)                             \
+    {                                                                          \
+        fprintf(stderr, "Got error %d at %s:%d\n", err, __FILE__, __LINE__);   \
+        cudaError_t cuda_err = cudaGetLastError();                             \
+        if (cuda_err != cudaSuccess)                                           \
+        {                                                                      \
+            fprintf(stderr, "  CUDA error \"%s\" also detected\n",             \
+                    cudaGetErrorString(cuda_err));                             \
+        }                                                                      \
+        exit(1);                                                               \
+    }                                                                          \
+}
+
+inline double seconds()
 {
-    for (int idx = 0; idx < N; idx++)
+    struct timeval tp;
+    struct timezone tzp;
+    int i = gettimeofday(&tp, &tzp);
+    return ((double)tp.tv_sec + (double)tp.tv_usec * 1.e-6);
+}
+
+#endif // _COMMON_H
+// Kernel function declaration
+__global__ void reduceUnrolling16(int *g_idata, int *g_odata, unsigned int n);
+// Function to calculate elapsed time in milliseconds
+double getElapsedTime(struct timeval start, struct timeval end)
+{
+    long seconds = end.tv_sec - start.tv_sec;
+    long microseconds = end.tv_usec - start.tv_usec;
+    double elapsed = seconds + microseconds / 1e6;
+    return elapsed * 1000; // Convert to milliseconds
+}
+int main()
+{
+    // Input size and host memory allocation
+    unsigned int n = 1 << 20; // 1 million elements
+    size_t size = n * sizeof(int);
+    int *h_idata = (int *)malloc(size);
+    int *h_odata = (int *)malloc(size);
+
+    // Initialize input data on the host
+    for (unsigned int i = 0; i < n; i++)
     {
-        C[idx] = A[idx] + B[idx];
+        h_idata[i] = 1;
     }
-}
 
-__global__ void sumArrays(float *A, float *B, float *C, const int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Device memory allocation
+    int *d_idata, *d_odata;
+    cudaMalloc((void **)&d_idata, size);
+    cudaMalloc((void **)&d_odata, size);
 
-    if (i < N) C[i] = A[i] + B[i];
-}
+    // Copy input data from host to device
+    cudaMemcpy(d_idata, h_idata, size, cudaMemcpyHostToDevice);
 
-__global__ void sumArraysZeroCopy(float *A, float *B, float *C, const int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Define grid and block dimensions
+    dim3 blockSize(256); // 256 threads per block
+    dim3 gridSize((n + blockSize.x * 16 - 1) / (blockSize.x * 16));
 
-    if (i < N) C[i] = A[i] + B[i];
-}
+    // Start CPU timer
+    struct timeval start_cpu, end_cpu;
+    gettimeofday(&start_cpu, NULL);
 
-__global__ void sumArraysZeroCopyWithUVA(float *A, float *B, float *C,
-        const int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i < N) C[i] = A[i] + B[i];
-}
-
-int main(int argc, char **argv)
-{
-    // set up device
-    int dev = 0;
-    CHECK(cudaSetDevice(dev));
-
-    // get device properties
-    cudaDeviceProp deviceProp;
-    CHECK(cudaGetDeviceProperties(&deviceProp, dev));
-
-    // check if support mapped memory
-    if (!deviceProp.canMapHostMemory)
+    // Compute the sum on the CPU
+    int sum_cpu = 0;
+    for (unsigned int i = 0; i < n; i++)
     {
-        printf("Device %d does not support mapping CPU host memory!\n", dev);
-        CHECK(cudaDeviceReset());
-        exit(EXIT_SUCCESS);
+        sum_cpu += h_idata[i];
     }
 
-    printf("Using Device %d: %s ", dev, deviceProp.name);
+    // Stop CPU timer
+    gettimeofday(&end_cpu, NULL);
+    double elapsedTime_cpu = getElapsedTime(start_cpu, end_cpu);
 
-    // set up data size of vectors
-    int ipower = 24;
+    // Start GPU timer
+    struct timeval start_gpu, end_gpu;
+    gettimeofday(&start_gpu, NULL);
 
-    if (argc > 1) ipower = atoi(argv[1]);
+    // Launch the reduction kernel
+    reduceUnrolling16<<<gridSize, blockSize>>>(d_idata, d_odata, n);
 
-    int nElem = 1 << ipower;
-    size_t nBytes = nElem * sizeof(float);
+    // Copy the result from device to host
+    cudaMemcpy(h_odata, d_odata, size, cudaMemcpyDeviceToHost);
 
-    if (ipower < 18)
+    // Compute the final sum on the GPU
+    int sum_gpu = 0;
+    for (unsigned int i = 0; i < gridSize.x; i++)
     {
-        printf("Vector size %d power %d  nbytes  %3.0f KB\n", nElem, ipower,
-               (float)nBytes / (1024.0f));
-    }
-    else
-    {
-        printf("Vector size %d power %d  nbytes  %3.0f MB\n", nElem, ipower,
-               (float)nBytes / (1024.0f * 1024.0f));
+        sum_gpu += h_odata[i];
     }
 
-    // part 1: using device memory
-    // malloc host memory
-    float *h_A, *h_B, *hostRef, *gpuRef;
-    h_A     = (float *)malloc(nBytes);
-    h_B     = (float *)malloc(nBytes);
-    hostRef = (float *)malloc(nBytes);
-    gpuRef  = (float *)malloc(nBytes);
+    // Stop GPU timer
+    gettimeofday(&end_gpu, NULL);
+    double elapsedTime_gpu = getElapsedTime(start_gpu, end_gpu);
 
-    // initialize data at host side
-    initialData(h_A, nElem);
-    initialData(h_B, nElem);
-    memset(hostRef, 0, nBytes);
-    memset(gpuRef,  0, nBytes);
+    // Print the results and elapsed times
+    printf("CPU Sum: %d\n", sum_cpu);
+    printf("GPU Sum: %d\n", sum_gpu);
+    printf("CPU Elapsed Time: %.2f ms\n", elapsedTime_cpu);
+    printf("GPU Elapsed Time: %.2f ms\n", elapsedTime_gpu);
 
-    // add vector at host side for result checks
-    sumArraysOnHost(h_A, h_B, hostRef, nElem);
+    // Free memory
+    free(h_idata);
+    free(h_odata);
+    cudaFree(d_idata);
+    cudaFree(d_odata);
 
-    // malloc device global memory
-    float *d_A, *d_B, *d_C;
-    CHECK(cudaMalloc((float**)&d_A, nBytes));
-    CHECK(cudaMalloc((float**)&d_B, nBytes));
-    CHECK(cudaMalloc((float**)&d_C, nBytes));
-
-    // transfer data from host to device
-    CHECK(cudaMemcpy(d_A, h_A, nBytes, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_B, h_B, nBytes, cudaMemcpyHostToDevice));
-
-    // set up execution configuration
-    int iLen = 512;
-    dim3 block (iLen);
-    dim3 grid  ((nElem + block.x - 1) / block.x);
-
-    double start = seconds();
-    sumArrays<<<grid, block>>>(d_A, d_B, d_C, nElem);
-    CHECK(cudaDeviceSynchronize());
-    double elapsed = seconds() - start;
-    printf("sumArrays, elapsed = %f s\n", elapsed);
-
-    // copy kernel result back to host side
-    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
-
-    // check device results
-    checkResult(hostRef, gpuRef, nElem);
-
-    // free device global memory
-    CHECK(cudaFree(d_A));
-    CHECK(cudaFree(d_B));
-
-    // free host memory
-    free(h_A);
-    free(h_B);
-
-    // part 2: using zerocopy memory for array A and B
-    // allocate zerocpy memory
-    CHECK(cudaHostAlloc((void **)&h_A, nBytes, cudaHostAllocMapped));
-    CHECK(cudaHostAlloc((void **)&h_B, nBytes, cudaHostAllocMapped));
-
-    // initialize data at host side
-    initialData(h_A, nElem);
-    initialData(h_B, nElem);
-    memset(hostRef, 0, nBytes);
-    memset(gpuRef,  0, nBytes);
-
-    // pass the pointer to device
-    CHECK(cudaHostGetDevicePointer((void **)&d_A, (void *)h_A, 0));
-    CHECK(cudaHostGetDevicePointer((void **)&d_B, (void *)h_B, 0));
-
-    // add at host side for result checks
-    sumArraysOnHost(h_A, h_B, hostRef, nElem);
-
-    // execute kernel with zero copy memory
-    start = seconds();
-    sumArraysZeroCopy<<<grid, block>>>(d_A, d_B, d_C, nElem);
-    CHECK(cudaDeviceSynchronize());
-    elapsed = seconds() - start;
-    printf("sumArraysZeroCopy, elapsed = %f s\n", elapsed);
-
-    // copy kernel result back to host side
-    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
-
-    // check device results
-    checkResult(hostRef, gpuRef, nElem);
-
-    memset(gpuRef,  0, nBytes);
-
-    // execute kernel with zero copy memory
-    start = seconds();
-    sumArraysZeroCopyWithUVA<<<grid, block>>>(h_A, h_B, d_C, nElem);
-    CHECK(cudaDeviceSynchronize());
-    elapsed = seconds() - start;
-    printf("sumArraysZeroCopy w/ UVA, elapsed = %f s\n", elapsed);
-
-    // copy kernel result back to host side
-    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
-
-    // check device results
-    checkResult(hostRef, gpuRef, nElem);
-
-    // free  memory
-    CHECK(cudaFree(d_C));
-    CHECK(cudaFreeHost(h_A));
-    CHECK(cudaFreeHost(h_B));
-
-    free(hostRef);
-    free(gpuRef);
-
-    // reset device
-    CHECK(cudaDeviceReset());
-    return EXIT_SUCCESS;
+    return 0;
 }
 
+__global__ void reduceUnrolling16(int *g_idata, int *g_odata, unsigned int n)
+{
+    // Set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 16 + threadIdx.x;
+
+    // Convert global data pointer to the local pointer of this block
+    int *idata = g_idata + blockIdx.x * blockDim.x * 16;
+
+    // Unrolling 16
+    if (idx + 15 * blockDim.x < n)
+    {
+        int a1 = g_idata[idx];
+        int a2 = g_idata[idx + blockDim.x];
+        int a3 = g_idata[idx + 2 * blockDim.x];
+        int a4 = g_idata[idx + 3 * blockDim.x];
+        int a5 = g_idata[idx + 4 * blockDim.x];
+        int a6 = g_idata[idx + 5 * blockDim.x];
+        int a7 = g_idata[idx + 6 * blockDim.x];
+        int a8 = g_idata[idx + 7 * blockDim.x];
+        int b1 = g_idata[idx + 8 * blockDim.x];
+        int b2 = g_idata[idx + 9 * blockDim.x];
+        int b3 = g_idata[idx + 10 * blockDim.x];
+        int b4 = g_idata[idx + 11 * blockDim.x];
+        int b5 = g_idata[idx + 12 * blockDim.x];
+        int b6 = g_idata[idx + 13 * blockDim.x];
+        int b7 = g_idata[idx + 14 * blockDim.x];
+        int b8 = g_idata[idx + 15 * blockDim.x];
+        g_idata[idx] = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8;
+    }
+
+    __syncthreads();
+
+    // In-place reduction in global memory
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            idata[tid] += idata[tid + stride];
+        }
+
+        // Synchronize within thread block
+        __syncthreads();
+    }
+
+    // Write result for this block to global memory
+    if (tid == 0)
+    {
+        g_odata[blockIdx.x] = idata[0];
+    }
+}
 ```
 
 ## OUTPUT:
-```
-Using Device 0: Tesla T4 Vector size 16777216 power 24  nbytes   64 MB
-sumArrays, elapsed = 0.117543 s
-sumArraysZeroCopy, elapsed = 0.010955 s
-sumArraysZeroCopy w/ UVA, elapsed = 0.010965 s
-```
+### Unrolling8
+![image](https://github.com/Rakshithadevi/PCA-EXP-3-PARALLEL-REDUCTION-USING-UNROLLING-TECHNIQUES-AY-23-24/assets/94165326/654fc5ef-815d-4319-a3ee-66e951f0e384)
+### Unrolling16
+![image](https://github.com/Rakshithadevi/PCA-EXP-3-PARALLEL-REDUCTION-USING-UNROLLING-TECHNIQUES-AY-23-24/assets/94165326/b6167a2d-e0b3-4232-a5dd-f1d5f5057aae)
+
 
 ## RESULT:
-Thus the program has been executed by unrolling by 8 and unrolling by 16. It is observed that _________ has executed with less elapsed time than _____________ with blocks_____,______.
+Thus the program has been executed by unrolling by 8 and unrolling by 16. It is observed that 16 has executed with less elapsed time than 8 with blocks 1048576,1048576.
